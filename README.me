@@ -1,0 +1,44 @@
+# CamMate – Handy Smart Camera Assistant Robot
+
+**Step 1:** Servo bring-up on ESP32-WROOM-32 with two MG995 (front & 
+rear).  
+**Step 2:** Add wheels using L298N (files stubbed: `WheelControl.*`).
+
+## Hardware
+- ESP32-WROOM-32 Dev Board
+- 2× MG995 servos (front & rear)
+- External 5–6 V servo PSU (≥2 A recommended)
+- (Later) L298N + 2 DC motors + separate motor PSU
+
+## Wiring (Servos)
+- MG995 V+ → external 5–6 V
+- MG995 GND → external PSU GND
+- **ESP32 GND → external PSU GND** (common ground)
+- Front signal → GPIO 18
+- Rear  signal → GPIO 19
+
+> If ESP32 resets or servos twitch: PSU sag or missing common ground. Add 
+1000–2200µF across servo PSU.
+
+## Software
+- Arduino IDE
+- Board: `ESP32 Dev Module`
+- Library: `ESP32Servo`
+
+## Serial Commands
+- `c`            – center both (90°)
+- `sf`           – sweep FRONT 60..120
+- `sr`           – sweep REAR  60..120
+- `bf=ANG`       – set both to ANG (0..180)
+- `ff=ANG`       – set front to ANG
+- `fr=ANG`       – set rear  to ANG
+- `mf=ANG`       – slow move front to ANG
+- `mr=ANG`       – slow move rear  to ANG
+- `help`         – show menu
+
+## Roadmap
+- [ ] Implement `WheelControl` for L298N (pins, PWM enable, brake/coast)
+- [ ] Motion presets: straight, arc, circle around target
+- [ ] Phone-grip servo/gimbal stabilization
+- [ ] Simple HTTP control UI (later)
+  
