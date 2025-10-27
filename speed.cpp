@@ -1,26 +1,28 @@
 #include "Speed.h"
 
-volatile SpeedMode g_speedMode = SPEED_NORMAL;
+// Default to NORMAL at boot
+SpeedMode g_speedMode = SPEED_NORMAL;
 
-static inline int clampInt(int v, int lo, int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+static inline float clamp01f(float v){
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
 
-int applySpeedScaling(int base, float steerExtent)
-{
-  // Base steering reduction
-  float scale = 1.0f - (SPEED_STEER_SCALE * steerExtent);
+int applySpeedScaling(int basePwm, float steerExtent) {
+  // Slow down as steering approaches extremes
+  float steerScale = 1.0f - (SPEED_STEER_SCALE * clamp01f(steerExtent));
 
-  // Mode scaling:
-  // Normal = 50%, Sport = 100%, Low = 50% of Normal
-  float modeMul = 1.0f;
-  int cap = MAX_SPEED_SPORT;
-
+  // Speed mode multiplier
+  float modeScale = 1.0f;
   switch (g_speedMode) {
-    case SPEED_SPORT:   modeMul = 1.0f;   cap = MAX_SPEED_SPORT;  break;
-    case SPEED_NORMAL:  modeMul = 0.5f;   cap = MAX_SPEED_NORMAL; break;
-    case SPEED_LOW:     modeMul = 0.5f * SPEED_LOW_FACTOR; cap = MAX_SPEED_NORMAL; break;
+    case SPEED_SPORT:  modeScale = 1.0f;  break;  // 100%
+    case SPEED_NORMAL: modeScale = 0.5f;  break;  // 50%
+    case SPEED_LOW:    modeScale = 0.25f; break;  // 25%
   }
 
-  int spd = (int)(base * scale * modeMul);
-  spd = clampInt(spd, -cap, cap);
-  return spd;
+  float v = basePwm * steerScale * modeScale;
+  if (v >  255) v =  255;
+  if (v < -255) v = -255;
+  return (int)v;
 }

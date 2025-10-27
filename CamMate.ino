@@ -1,8 +1,11 @@
 /*
-  CamMate v3.5 – Wi-Fi AP + Joystick + Low/Normal/Sport + Recorder (5-slot ring)
-  - 5 recording slots: /rec1.jsonl ... /rec5.jsonl  (+ .meta with frames & duration)
-  - Auto-record wraps: the 6th overwrites slot #1, etc.
-  - Web UI: pick slot, record (auto or to slot), play, reverse, stop, clear, list
+  CamMate v3.9 – Solid UI + Dual Joysticks + 3-Speed + 5-Slot Recorder
+  - Left joystick = Drive throttle (Y only)
+  - Right joystick = Steering (Manual = direct servo, Off = planner)
+  - Modes: Normal / Crab / Circle (diameter)
+  - Speeds: Low / Normal / Sport
+  - Recorder: 5 slots with auto-wrap, list/record/play/clear/abort
+  - Fix: Record & replay servo angles when manual-steer is ON
 */
 
 #include <Arduino.h>
@@ -10,11 +13,11 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <SPIFFS.h>
+
 #include "config.h"
 #include "ServoControl.h"
 #include "WheelControl.h"
 #include "Utils.h"
-
 #include "MotionPlanner.h"
 #include "Speed.h"
 #include "Recorder.h"
@@ -23,23 +26,33 @@
 #define SERIAL_BAUD 115200
 #endif
 
-// -------- Globals --------
+// ==== Globals ====
 ServoControl servoFront, servoRear;
 WheelControl wheels;
 WebServer server(HTTP_PORT);
 Recorder recorder;
 
-volatile float  joyX = 0.0f, joyY = 0.0f;
+// State
+volatile float driveY = 0.0f;
+volatile float steerX = 0.0f;
+volatile float steerY = 0.0f;
 volatile UIMode uiMode = MODE_NORMAL;
-volatile float  circleDiam = 1.0f;
-volatile bool   eStop = false;
+volatile float circleDiam = 1.0f;     // 0..1
+volatile bool manualSteer = true;     // ON = right pad moves servos directly
+volatile bool eStop = false;
 
-// helpers
-static inline void setFrontSteer(int d){ servoFront.writeDeg(constrain(d, FF_MIN, FF_MAX)); }
-static inline void setRearSteer (int d){ servoRear .writeDeg(constrain(d, FR_MIN, FR_MAX)); }
+volatile int g_manualFF = SERVO_CENTER;  // last manual targets
+volatile int g_manualFR = SERVO_CENTER;
+
+// Helpers
+static inline int clampInt(int v,int lo,int hi){return (v<lo)?lo:((v>hi)?hi:v);}
+static inline float clamp11(float v){return (v<-1)?-1:((v>1)?1:v);}
+static inline float clamp01(float v){return (v<0)?0:((v>1)?1:v);}
+static inline void setFrontSteer(int d){ servoFront.writeDeg(clampInt(d, FF_MIN, FF_MAX)); }
+static inline void setRearSteer (int d){ servoRear .writeDeg(clampInt(d, FR_MIN, FR_MAX)); }
 static inline void centerSteer(){ setFrontSteer(SERVO_CENTER); setRearSteer(SERVO_CENTER); }
 
-// -------- Recorder ring (5 slots) helpers --------
+// ==== Recorder: 5-slot ring ====
 static const int  REC_SLOTS = 5;
 static const char* META_NEXT_PATH = "/rec_next.txt";
 
@@ -47,8 +60,7 @@ static int readNextSlot() {
   if (!SPIFFS.exists(META_NEXT_PATH)) return 1;
   File f = SPIFFS.open(META_NEXT_PATH, FILE_READ);
   if (!f) return 1;
-  String s = f.readString();
-  f.close();
+  String s = f.readString(); f.close();
   int n = s.toInt();
   if (n < 1 || n > REC_SLOTS) n = 1;
   return n;
@@ -63,55 +75,73 @@ static void writeNextSlot(int next) {
 static void pathForSlot(int slot, char* dst, size_t cap, bool meta=false) {
   snprintf(dst, cap, meta ? "/rec%d.meta" : "/rec%d.jsonl", slot);
 }
-static int slotAfter(int slot) {
-  ++slot; if (slot > REC_SLOTS) slot = 1; return slot;
-}
+static int slotAfter(int slot) { ++slot; if (slot > REC_SLOTS) slot = 1; return slot; }
 
-// -------- Web UI (HTML) --------
+// ==== UI (ASCII only; flexible layout) ====
 const char PAGE_INDEX[] PROGMEM = R"HTML(
 <!doctype html><html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CamMate</title>
 <style>
-body{font-family:sans-serif;margin:12px}
-.row{display:flex;gap:12px;flex-wrap:wrap}
-#pad{width:260px;height:260px;background:#eee;border-radius:12px;position:relative;touch-action:none}
-#dot{position:absolute;width:14px;height:14px;border-radius:50%;background:#333;transform:translate(-50%,-50%)}
-.card{padding:12px;border:1px solid #ddd;border-radius:12px}
-button{padding:10px 14px;border-radius:10px;border:1px solid #999;background:#fafafa;margin-right:4px;cursor:pointer}
-button.sel{background:#444;color:#fff}
-button.warn{background:#fbe9e7;border-color:#f4511e}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#222;color:#fff;font-size:12px}
-input[type=range]{width:220px}
-table{border-collapse:collapse;margin-top:6px}
-td,th{padding:6px 10px;border:1px solid #ddd;font-size:13px}
-small code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
-</style></head><body>
-<h2>CamMate Controller <span id="speedBadge" class="badge">Normal</span></h2>
+  :root{ --pad: min(40vw, 360px); --dot: 18px; }
+  body{font-family:sans-serif;margin:10px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
+  .card{border:1px solid #ddd;border-radius:12px;padding:12px}
+  .pads{display:flex;gap:12px;flex-wrap:wrap}
+  .pad{width:var(--pad);height:var(--pad);background:#f2f2f2;border-radius:12px;position:relative;touch-action:none}
+  .pad .label{position:absolute;left:10px;top:10px;background:#fff;border:1px solid #ccc;border-radius:8px;padding:2px 8px;font-size:12px}
+  .dot{position:absolute;width:var(--dot);height:var(--dot);border-radius:50%;background:#222;transform:translate(-50%,-50%);border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,0.4)}
+  h2{margin:6px 0 12px}
+  button{padding:8px 12px;border-radius:8px;border:1px solid #aaa;background:#fafafa;margin:3px;cursor:pointer}
+  button.sel{background:#333;color:#fff}
+  button.warn{background:#ffecec;border-color:#e53935}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#222;color:#fff;font-size:12px}
+  input[type=range]{width:220px}
+  table{border-collapse:collapse;margin-top:8px;font-size:13px}
+  th,td{padding:6px 8px;border:1px solid #ddd}
+  .stack{display:flex;flex-direction:column;gap:10px}
+</style>
+</head><body>
+<h2>CamMate <span id="spdBadge" class="badge">Normal</span></h2>
 
 <div class="row">
-  <!-- Joystick -->
-  <div id="pad" class="card"><div id="dot" style="left:130px;top:130px"></div></div>
+  <div class="pads">
+    <div class="pad card" id="padDrive">
+      <div class="label">Drive</div>
+      <div class="dot" id="dotDrive" style="left:50%;top:50%"></div>
+    </div>
+    <div class="pad card" id="padSteer">
+      <div class="label">Steer</div>
+      <div class="dot" id="dotSteer" style="left:50%;top:50%"></div>
+    </div>
+  </div>
 
-  <!-- Controls -->
-  <div class="card">
-    <div>Drive Mode:
-      <label><input type="radio" name="mode" value="0" checked> Normal</label>
-      <label><input type="radio" name="mode" value="1"> Crab</label>
-      <label><input type="radio" name="mode" value="2"> Circle</label>
+  <div class="card stack">
+    <div>
+      <div>Manual Steer:
+        <button id="msOn"  class="sel">On</button>
+        <button id="msOff">Off</button>
+      </div>
+      <div id="modeRow" style="margin-top:6px">
+        Mode:
+        <label><input type="radio" name="mode" value="0" checked> Normal</label>
+        <label><input type="radio" name="mode" value="1"> Crab</label>
+        <label><input type="radio" name="mode" value="2"> Circle</label>
+      </div>
+      <div id="diamRow" style="margin-top:6px">
+        Circle diameter
+        <input id="diam" type="range" min="0" max="1" step="0.01" value="1">
+        <span id="dval" class="badge">1.00</span>
+      </div>
     </div>
 
-    <div style="margin-top:10px">Circle diameter
-      <input id="diam" type="range" min="0" max="1" step="0.01" value="1">
-      <span id="dval" class="badge">1.00</span>
-    </div>
-
-    <div style="margin-top:10px">
+    <div>
       <button id="center">Center</button>
-      <button id="stop">STOP</button>
+      <button id="stop" class="warn">STOP</button>
+      <button id="abort" class="warn">Stop Playback</button>
     </div>
 
-    <div style="margin-top:10px">
+    <div>
       Speed:
       <button id="spdLow">Low</button>
       <button id="spdNormal" class="sel">Normal</button>
@@ -119,144 +149,213 @@ small code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
     </div>
   </div>
 
-  <!-- Recorder -->
-  <div class="card">
-    <div style="margin-bottom:6px"><b>Recorder (5 slots, auto-wrap)</b></div>
+  <div class="card" style="min-width:320px">
+    <h3 style="margin:4px 0 8px">Recorder (5 slots)</h3>
     <div>
-      Slots:
-      <span id="slotBtns"></span>
-      <button id="refresh">↻</button>
+      Active slot:
+      <span id="slots"></span>
+      <button id="refresh">Refresh</button>
     </div>
-    <table id="slotTbl">
-      <thead><tr><th>#</th><th>Status</th><th>Frames</th><th>Duration</th><th>Size</th></tr></thead>
+    <table id="tbl">
+      <thead><tr><th>#</th><th>Status</th><th>Frames</th><th>Dur(ms)</th><th>Size</th></tr></thead>
       <tbody></tbody>
     </table>
     <div style="margin-top:8px">
-      <button id="recAuto"  class="warn">Record (Auto)</button>
+      <button id="recAuto"  class="warn">Record (Auto-slot)</button>
       <button id="recTo">Record to Slot</button>
-      <button id="recStop">Stop</button>
+      <button id="recStop">Stop Record</button>
     </div>
     <div style="margin-top:6px">
-      <button id="playF">Play ▶︎</button>
-      <button id="playR">Play ◀︎</button>
+      <button id="playF">Play Forward</button>
+      <button id="playR">Play Reverse</button>
       <button id="clear">Clear Slot</button>
     </div>
-    <small style="display:block;margin-top:8px">
-      Auto mode writes to the next slot and wraps (6th replaces #1).<br>
-      Serial: <code>recstart [slot]</code>, <code>recstop</code>, <code>play [slot]</code>, <code>playr [slot]</code>, <code>recclear [slot]</code>.
-    </small>
   </div>
 </div>
 
 <script>
-const pad=document.getElementById('pad'),dot=document.getElementById('dot'),
-diam=document.getElementById('diam'),dval=document.getElementById('dval'),
-tbl=document.querySelector('#slotTbl tbody'), slotBtnsSpan=document.getElementById('slotBtns'),
-badge=document.getElementById('speedBadge');
+const DEAD=0.07; // dead-zone
+let manual=true, mode=0, diam=1.0, slot=1;
+let spd='normal';
+const badge=document.getElementById('spdBadge');
 
-let mode=0,x=0,y=0,active=false,lastSend=0,spd='normal',slot=1;
+function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+function dead(v){return Math.abs(v)<DEAD?0:v;}
 
-function setDot(px,py){dot.style.left=px+'px';dot.style.top=py+'px';}
-function send(){
-  const now=Date.now(); if(now-lastSend<60)return; lastSend=now;
-  fetch(`/ctl?x=${x.toFixed(3)}&y=${y.toFixed(3)}&mode=${mode}&diam=${Number(diam.value).toFixed(2)}`).catch(()=>{});
+function setupPad(id, cb){
+  const pad=document.getElementById(id), dot=pad.querySelector('.dot');
+  let active=false;
+  function setDot(px,py){ dot.style.left=px+'px'; dot.style.top=py+'px'; }
+  function center(){ setDot(pad.clientWidth/2, pad.clientHeight/2); }
+  pad.addEventListener('pointerdown',e=>{active=true;pad.setPointerCapture(e.pointerId);handle(e);});
+  pad.addEventListener('pointermove',e=>{ if(active) handle(e); });
+  pad.addEventListener('pointerup',e=>{ active=false; center(); cb(0,0); });
+  function handle(e){
+    const r=pad.getBoundingClientRect();
+    let px=e.clientX, py=e.clientY;
+    px=clamp(px,r.left,r.right); py=clamp(py,r.top,r.bottom);
+    const nx=((px-r.left)/r.width)*2-1;
+    const ny=((py-r.top)/r.height)*2-1;
+    const x=dead(nx), y=dead(ny);
+    setDot(px-r.left,py-r.top);
+    cb(x,-y);
+  }
+  center();
 }
-function handle(e){
-  const r=pad.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2;
-  let px=e.touches?e.touches[0].clientX:e.clientX,py=e.touches?e.touches[0].clientY:e.clientY;
-  px=Math.max(r.left,Math.min(r.right,px)); py=Math.max(r.top,Math.min(r.bottom,py));
-  const nx=(px-cx)/(r.width/2), ny=(cy-py)/(r.height/2);
-  x=Math.max(-1,Math.min(1,nx)); y=Math.max(-1,Math.min(1,ny));
-  setDot(px-r.left,py-r.top); send();
-}
-pad.addEventListener('pointerdown',e=>{active=true;pad.setPointerCapture(e.pointerId);handle(e);});
-pad.addEventListener('pointermove',e=>{if(active)handle(e);});
-pad.addEventListener('pointerup',e=>{active=false;x=0;y=0;setDot(pad.clientWidth/2,pad.clientHeight/2);send();});
-document.querySelectorAll('input[name=mode]').forEach(r=>r.addEventListener('change',()=>{mode=Number(document.querySelector('input[name=mode]:checked').value);send();}));
-diam.addEventListener('input',()=>{dval.textContent=Number(diam.value).toFixed(2);send();});
-document.getElementById('center').onclick=()=>{fetch('/center').catch(()=>{});};
-document.getElementById('stop').onclick=()=>{fetch('/stop').catch(()=>{});};
 
-function setSpeed(newSpd){
-  spd=newSpd;
-  document.getElementById('spdLow').classList.remove('sel');
-  document.getElementById('spdNormal').classList.remove('sel');
-  document.getElementById('spdSport').classList.remove('sel');
-  if(spd==='low') document.getElementById('spdLow').classList.add('sel');
-  if(spd==='normal') document.getElementById('spdNormal').classList.add('sel');
-  if(spd==='sport') document.getElementById('spdSport').classList.add('sel');
-  badge.textContent = spd.charAt(0).toUpperCase()+spd.slice(1);
-  fetch(`/speed?mode=${spd}`).catch(()=>{});
-}
-document.getElementById('spdLow').onclick   = ()=>setSpeed('low');
-document.getElementById('spdNormal').onclick= ()=>setSpeed('normal');
-document.getElementById('spdSport').onclick = ()=>setSpeed('sport');
+setupPad('padDrive', (x,y)=>{
+  fetch(`/ctl_drive?y=${y.toFixed(3)}`).catch(()=>{});
+});
 
-// ---- Recorder UI ----
-function renderSlots(list){
-  // buttons
-  slotBtnsSpan.innerHTML='';
-  list.forEach(it=>{
+setupPad('padSteer', (x,y)=>{
+  if (manual)
+    fetch(`/ctl_servos?x=${x.toFixed(3)}&y=${y.toFixed(3)}`).catch(()=>{});
+  else
+    fetch(`/ctl_steer?x=${x.toFixed(3)}&y=${y.toFixed(3)}&mode=${mode}&diam=${diam.toFixed(2)}`).catch(()=>{});
+});
+
+// Manual steer toggle
+const msOn = document.getElementById('msOn');
+const msOff= document.getElementById('msOff');
+function setManual(on){
+  manual=on;
+  msOn.classList.toggle('sel', on);
+  msOff.classList.toggle('sel', !on);
+  document.getElementById('modeRow').style.opacity = on ? 0.45 : 1;
+  document.getElementById('diamRow').style.opacity = on ? 0.45 : 1;
+  fetch(`/ui/manual_steer?on=${on?1:0}`).catch(()=>{});
+}
+msOn.onclick = ()=> setManual(true);
+msOff.onclick= ()=> setManual(false);
+
+// Modes + diameter
+document.querySelectorAll('input[name=mode]').forEach(r=>{
+  r.addEventListener('change', ()=>{
+    mode = Number(document.querySelector('input[name=mode]:checked').value);
+  });
+});
+const diamEl=document.getElementById('diam'), dval=document.getElementById('dval');
+diamEl.addEventListener('input', ()=>{
+  diam = Number(diamEl.value);
+  dval.textContent = diam.toFixed(2);
+});
+
+// Speed
+function setSpeed(s){
+  spd=s;
+  badge.textContent = s.charAt(0).toUpperCase()+s.slice(1);
+  document.getElementById('spdLow').classList.toggle('sel', s==='low');
+  document.getElementById('spdNormal').classList.toggle('sel', s==='normal');
+  document.getElementById('spdSport').classList.toggle('sel', s==='sport');
+  fetch(`/speed?mode=${s}`).catch(()=>{});
+}
+document.getElementById('spdLow').onclick=()=>setSpeed('low');
+document.getElementById('spdNormal').onclick=()=>setSpeed('normal');
+document.getElementById('spdSport').onclick=()=>setSpeed('sport');
+
+// Center / stop / abort
+document.getElementById('center').onclick=()=>fetch('/center').catch(()=>{});
+document.getElementById('stop').onclick  =()=>fetch('/stop').catch(()=>{});
+document.getElementById('abort').onclick =()=>fetch('/rec/abort').catch(()=>{});
+
+// Recorder UI
+const slotsDiv=document.getElementById('slots');
+const tbody=document.querySelector('#tbl tbody');
+function drawSlots(){
+  slotsDiv.innerHTML='';
+  for(let i=1;i<=5;i++){
     const b=document.createElement('button');
-    b.textContent=it.slot;
-    b.className = (slot===it.slot)?'sel':'';
-    b.onclick=()=>{slot=it.slot; renderSlots(list);}
-    slotBtnsSpan.appendChild(b);
-  });
-  // table
-  tbl.innerHTML='';
-  list.forEach(it=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML = `<td>${it.slot}</td>
-      <td>${it.exists?'Saved':'—'}</td>
-      <td>${it.frames||0}</td>
-      <td>${it.duration_ms? (it.duration_ms/1000).toFixed(1)+'s' : '—'}</td>
-      <td>${it.bytes? it.bytes+' B' : '—'}</td>`;
-    tbl.appendChild(tr);
-  });
+    b.textContent=i; if(i===slot) b.classList.add('sel');
+    b.onclick=()=>{ slot=i; drawSlots(); };
+    slotsDiv.appendChild(b);
+  }
 }
-function refreshList(){ fetch('/rec/list').then(r=>r.json()).then(renderSlots).catch(()=>{}); }
+drawSlots();
+
+function refreshList(){
+  fetch('/rec/list').then(r=>r.json()).then(arr=>{
+    tbody.innerHTML='';
+    arr.forEach(it=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML = `<td>${it.slot}</td>
+        <td>${it.exists?'OK':'(empty)'}</td>
+        <td>${it.frames||0}</td>
+        <td>${it.duration_ms||0}</td>
+        <td>${it.bytes||0}</td>`;
+      tbody.appendChild(tr);
+    });
+  }).catch(()=>{});
+}
 document.getElementById('refresh').onclick=refreshList;
+refreshList();
 
-document.getElementById('recAuto').onclick = ()=>{ fetch('/rec/start').then(()=>refreshList()); };
-document.getElementById('recTo').onclick   = ()=>{ fetch('/rec/start?slot='+slot).then(()=>refreshList()); };
-document.getElementById('recStop').onclick = ()=>{ fetch('/rec/stop').then(()=>refreshList()); };
+// Record / Play / Clear
+document.getElementById('recAuto').onclick = ()=>fetch('/rec/start').then(refreshList);
+document.getElementById('recTo').onclick   = ()=>fetch(`/rec/start?slot=${slot}`).then(refreshList);
+document.getElementById('recStop').onclick = ()=>fetch('/rec/stop').then(refreshList);
+document.getElementById('playF').onclick   = ()=>fetch(`/rec/play?slot=${slot}&dir=f`);
+document.getElementById('playR').onclick   = ()=>fetch(`/rec/play?slot=${slot}&dir=r`);
+document.getElementById('clear').onclick   = ()=>fetch(`/rec/clear?slot=${slot}`).then(refreshList);
 
-document.getElementById('playF').onclick = ()=>{ fetch('/rec/play?dir=f&slot='+slot).catch(()=>{}); };
-document.getElementById('playR').onclick = ()=>{ fetch('/rec/play?dir=r&slot='+slot).catch(()=>{}); };
-document.getElementById('clear').onclick = ()=>{ fetch('/rec/clear?slot='+slot).then(()=>refreshList()); };
-
-refreshList(); // initial
+// Defaults
+setManual(true);
+setSpeed('normal');
 </script>
 </body></html>
 )HTML";
 
-// -------- HTTP handlers --------
-static void handleIndex(){ server.send_P(200,"text/html",PAGE_INDEX); }
+// ==== HTTP Handlers ====
+static void handleIndex(){ server.send_P(200, "text/html", PAGE_INDEX); }
 
-static void handleCtl(){
-  if (server.hasArg("x"))    joyX       = server.arg("x").toFloat();
-  if (server.hasArg("y"))    joyY       = server.arg("y").toFloat();
-  if (server.hasArg("mode")) uiMode     = (UIMode)server.arg("mode").toInt();
-  if (server.hasArg("diam")) circleDiam = server.arg("diam").toFloat();
-  recorder.pushLive(joyX, joyY, uiMode, circleDiam, g_speedMode);
+static void handleCtlDrive(){
+  if (server.hasArg("y")) driveY = clamp11(server.arg("y").toFloat());
+  recorder.pushLive(manualSteer, steerX, driveY, uiMode, circleDiam, g_speedMode, g_manualFF, g_manualFR);
   eStop = false;
   server.send(204);
 }
+
+static void handleCtlSteer(){
+  if (server.hasArg("x")) steerX = clamp11(server.arg("x").toFloat());
+  if (server.hasArg("y")) steerY = clamp11(server.arg("y").toFloat());
+  if (server.hasArg("mode")) uiMode = (UIMode)server.arg("mode").toInt();
+  if (server.hasArg("diam")) circleDiam = clamp01(server.arg("diam").toFloat());
+  recorder.pushLive(manualSteer, steerX, driveY, uiMode, circleDiam, g_speedMode, g_manualFF, g_manualFR);
+  eStop = false;
+  server.send(204);
+}
+
+static void handleCtlServos(){
+  float x = 0, y = 0;
+  if (server.hasArg("x")) x = clamp11(server.arg("x").toFloat());
+  if (server.hasArg("y")) y = clamp11(server.arg("y").toFloat());
+  int ff = SERVO_CENTER + (int)roundf(x * (FF_MAX - SERVO_CENTER));
+  int fr = SERVO_CENTER + (int)roundf(y * (FR_MAX - SERVO_CENTER));
+  g_manualFF = clampInt(ff, FF_MIN, FF_MAX);
+  g_manualFR = clampInt(fr, FR_MIN, FR_MAX);
+  recorder.pushLive(true, steerX, driveY, uiMode, circleDiam, g_speedMode, g_manualFF, g_manualFR);
+  eStop = false;
+  server.send(204);
+}
+
+static void handleManual(){ // /ui/manual_steer?on=1|0
+  if (server.hasArg("on")) manualSteer = (server.arg("on").toInt()!=0);
+  server.send(204);
+}
+
+static void handleCenter(){ centerSteer(); eStop=false; server.send(204); }
 static void handleStop(){ eStop = true; server.send(204); }
-static void handleCenter(){ centerSteer(); eStop = false; server.send(204); }
+
 static void handleSpeed(){
   if (server.hasArg("mode")) {
     String m = server.arg("mode");
     if      (m=="sport")  g_speedMode = SPEED_SPORT;
     else if (m=="low")    g_speedMode = SPEED_LOW;
     else                  g_speedMode = SPEED_NORMAL;
-    Serial.printf("[SPEED] Mode: %s\n", g_speedMode==SPEED_SPORT?"SPORT":(g_speedMode==SPEED_LOW?"LOW":"NORMAL"));
   }
   server.send(204);
 }
 
-// Build JSON list of 5 slots with exists/frames/duration/bytes
+// Recorder: list/record/play/clear/abort (slot-aware)
 static void handleRecList(){
   String out = "[";
   for (int s=1; s<=REC_SLOTS; ++s) {
@@ -278,20 +377,14 @@ static void handleRecList(){
   server.send(200,"application/json", out);
 }
 
-// Start recording: optional ?slot=N ; if missing -> auto with wrap
 static void handleRecStart(){
   int reqSlot = server.hasArg("slot") ? server.arg("slot").toInt() : 0;
-  int slot = reqSlot>=1 && reqSlot<=REC_SLOTS ? reqSlot : readNextSlot();
-
+  int slot = (reqSlot>=1 && reqSlot<=REC_SLOTS) ? reqSlot : readNextSlot();
   char pJson[20], pMeta[20];
   pathForSlot(slot, pJson, sizeof(pJson), false);
   pathForSlot(slot, pMeta, sizeof(pMeta), true);
-
-  // start recording to this slot
   if (recorder.startRecording(pJson, pMeta)) {
-    // if auto, advance pointer for NEXT time
     if (reqSlot==0) writeNextSlot(slotAfter(slot));
-    Serial.printf("[REC] start slot #%d -> %s\n", slot, pJson);
     server.send(200,"text/plain","REC START");
   } else {
     server.send(500,"text/plain", recorder.lastError());
@@ -299,7 +392,6 @@ static void handleRecStart(){
 }
 static void handleRecStop(){ recorder.stopRecording(); server.send(200,"text/plain","REC STOP"); }
 
-// Play: ?slot=N&dir=f|r
 static void handleRecPlay(){
   int slot = server.hasArg("slot") ? server.arg("slot").toInt() : 1;
   char pJson[20]; pathForSlot(slot, pJson, sizeof(pJson), false);
@@ -308,8 +400,6 @@ static void handleRecPlay(){
   if (ok) server.send(200,"text/plain","PLAY");
   else    server.send(500,"text/plain", recorder.lastError());
 }
-
-// Clear: ?slot=N   (removes jsonl + meta)
 static void handleRecClear(){
   int slot = server.hasArg("slot") ? server.arg("slot").toInt() : 1;
   char pJson[20], pMeta[20];
@@ -319,212 +409,98 @@ static void handleRecClear(){
   bool ok2 = recorder.clearFile(pMeta);
   server.send((ok1&&ok2)?200:500, "text/plain", (ok1&&ok2)?"CLEARED":"ERR");
 }
+static void handleRecAbort(){ recorder.stopPlayback(); eStop = true; server.send(200,"text/plain","ABORTED"); }
 
-// -------- Init WiFi & HTTP --------
+// ==== WiFi + HTTP ====
 static void initWiFi(){
   WiFi.mode(WIFI_AP);
   IPAddress apIP(AP_IP_OCT1,AP_IP_OCT2,AP_IP_OCT3,AP_IP_OCT4);
   IPAddress gw(AP_GW_OCT1,AP_GW_OCT2,AP_GW_OCT3,AP_GW_OCT4);
   IPAddress msk(AP_MASK_OCT1,AP_MASK_OCT2,AP_MASK_OCT3,AP_MASK_OCT4);
-  bool cfg=WiFi.softAPConfig(apIP,gw,msk);
-  bool ok=WiFi.softAP(WIFI_SSID,WIFI_PASS);
+  bool cfg = WiFi.softAPConfig(apIP,gw,msk);
+  bool ok  = WiFi.softAP(WIFI_SSID, WIFI_PASS);
   delay(200);
-  Serial.printf("[WiFi] %s  SSID:%s  IP:%s  (cfg:%s)\n", ok?"AP STARTED":"FAILED",
-                WIFI_SSID, WiFi.softAPIP().toString().c_str(), cfg?"OK":"ERR");
+  Serial.printf("[WiFi] %s  SSID:%s  IP:%s  (cfg:%s)\n",
+    ok?"AP STARTED":"FAILED", WIFI_SSID, WiFi.softAPIP().toString().c_str(), cfg?"OK":"ERR");
 }
 static void initHttp(){
-  server.on("/",        HTTP_GET, handleIndex);
-  server.on("/ctl",     HTTP_GET, handleCtl);
-  server.on("/stop",    HTTP_GET, handleStop);
-  server.on("/center",  HTTP_GET, handleCenter);
-  server.on("/speed",   HTTP_GET, handleSpeed);
+  server.on("/", HTTP_GET, handleIndex);
 
-  // Recorder endpoints
+  server.on("/ctl_drive",  HTTP_GET, handleCtlDrive);
+  server.on("/ctl_steer",  HTTP_GET, handleCtlSteer);
+  server.on("/ctl_servos", HTTP_GET, handleCtlServos);
+  server.on("/ui/manual_steer", HTTP_GET, handleManual);
+
+  server.on("/center", HTTP_GET, handleCenter);
+  server.on("/stop",   HTTP_GET, handleStop);
+  server.on("/speed",  HTTP_GET, handleSpeed);
+
   server.on("/rec/list",  HTTP_GET, handleRecList);
   server.on("/rec/start", HTTP_GET, handleRecStart);
   server.on("/rec/stop",  HTTP_GET, handleRecStop);
   server.on("/rec/play",  HTTP_GET, handleRecPlay);
   server.on("/rec/clear", HTTP_GET, handleRecClear);
+  server.on("/rec/abort", HTTP_GET, handleRecAbort);
 
   server.begin();
-  Serial.printf("[HTTP] Web server on port %d\n", HTTP_PORT);
+  Serial.printf("[HTTP] Listening on %d\n", HTTP_PORT);
 }
 
-// -------- Legacy serial helpers --------
-enum SelectedServo { SEL_FRONT = 0, SEL_REAR = 1 };
-SelectedServo selected = SEL_FRONT;
-
-void selectFront(){ selected = SEL_FRONT; Serial.println(F("[SELECT] Front servo selected")); }
-void selectRear(){  selected = SEL_REAR;  Serial.println(F("[SELECT] Rear  servo selected"));  }
-
-void moveSelectedBy(int delta){
-  if (selected == SEL_FRONT) {
-    int cur = servoFront.readDeg(); if (cur<0) cur = SERVO_CENTER;
-    int nxt = constrain(cur + delta, FF_MIN, FF_MAX);
-    servoFront.writeDeg(nxt);
-    Serial.printf("[MOVE] Front: %d -> %d (delta %+d)\n", cur, nxt, delta);
-  } else {
-    int cur = servoRear.readDeg(); if (cur<0) cur = SERVO_CENTER;
-    int nxt = constrain(cur + delta, FR_MIN, FR_MAX);
-    servoRear.writeDeg(nxt);
-    Serial.printf("[MOVE] Rear : %d -> %d (delta %+d)\n", cur, nxt, delta);
-  }
-}
-
-void printWheelHelp(){
-  Serial.println(F("=== Wheel Commands (legacy) ==="));
-  Serial.println(F("  ws=VAL      -> both speeds (-255..255)"));
-  Serial.println(F("  wbrake      -> brake both"));
-  Serial.println(F("  wstop       -> coast (free-roll)"));
-  Serial.println(F("Web UI at your AP IP (see log)."));
-}
-
-void processWheelCommand(const String& cmd){
-  if (cmd == "wstop") { wheels.coast(); Serial.println(F("[WHEEL] coast")); }
-  else if (cmd == "wbrake") { wheels.brake(); Serial.println(F("[WHEEL] brake")); }
-  else if (cmd.startsWith("ws=")) {
-    int v = cmd.substring(3).toInt();
-    wheels.setSpeedBoth(v);
-    Serial.printf("[WHEEL] both=%d\n", v);
-  } else {
-    Serial.println(F("[WHEEL] Unknown. Use ws=, wstop, wbrake"));
-  }
-}
-
-void processLineCommand(const String& cmd){
-  if (cmd == "c") { centerSteer(); eStop=false; Serial.println(F("[CMD] Centered.")); }
-  else if (cmd == "sf") { Serial.println(F("[CMD] Sweep FRONT 60..140")); servoFront.sweep(FF_MIN,FF_MAX,1,10); }
-  else if (cmd == "sr") { Serial.println(F("[CMD] Sweep REAR  40..120")); servoRear.sweep(FR_MIN,FR_MAX,1,10); }
-  else if (cmd.equalsIgnoreCase("A90")) { centerSteer(); eStop=false; }
-  else if (cmd.length() && cmd[0]=='w') { processWheelCommand(cmd); }
-  // Recorder serial with slot (optional number after command)
-  else if (cmd.startsWith("recstart")) {
-    int s = cmd.length()>8 ? cmd.substring(8).toInt() : 0;
-    if (s<1 || s>REC_SLOTS) s = readNextSlot();
-    char pJson[20], pMeta[20]; pathForSlot(s,pJson,sizeof(pJson),false); pathForSlot(s,pMeta,sizeof(pMeta),true);
-    if (recorder.startRecording(pJson,pMeta)) {
-      if (cmd.length()<=8) writeNextSlot(slotAfter(s)); // auto advances only if no explicit slot
-      Serial.printf("[REC] start slot #%d\n", s);
-    } else Serial.printf("[REC] ERR: %s\n", recorder.lastError());
-  }
-  else if (cmd=="recstop") { recorder.stopRecording(); Serial.println(F("[REC] stop")); }
-  else if (cmd.startsWith("playr")) {
-    int s = cmd.length()>5 ? cmd.substring(5).toInt() : 1;
-    char pJson[20]; pathForSlot(s,pJson,sizeof(pJson),false);
-    if (recorder.startPlayback(PLAY_REVERSE,pJson)) Serial.printf("[REC] play reverse slot #%d\n", s);
-    else Serial.printf("[REC] ERR: %s\n", recorder.lastError());
-  }
-  else if (cmd.startsWith("play")) {
-    int s = cmd.length()>4 ? cmd.substring(4).toInt() : 1;
-    char pJson[20]; pathForSlot(s,pJson,sizeof(pJson),false);
-    if (recorder.startPlayback(PLAY_FORWARD,pJson)) Serial.printf("[REC] play slot #%d\n", s);
-    else Serial.printf("[REC] ERR: %s\n", recorder.lastError());
-  }
-  else if (cmd.startsWith("recclear")) {
-    int s = cmd.length()>8 ? cmd.substring(8).toInt() : 1;
-    char pJson[20], pMeta[20]; pathForSlot(s,pJson,sizeof(pJson),false); pathForSlot(s,pMeta,sizeof(pMeta),true);
-    bool ok1=recorder.clearFile(pJson), ok2=recorder.clearFile(pMeta);
-    Serial.println((ok1&&ok2)?F("[REC] cleared"):F("[REC] clear ERR"));
-  }
-  else if (cmd=="help") { printMenu(); printWheelHelp(); }
-  else { Serial.println(F("[WARN] Unknown. Type 'help'.")); }
-}
-
-// -------- Setup & Loop --------
+// ==== Setup & Loop ====
 void setup(){
   Serial.begin(SERIAL_BAUD); delay(400);
-  Serial.println(F("\n=== CamMate v3.5 – 5-slot Recorder Ring ==="));
+  Serial.println(F("\n=== CamMate v3.9 ==="));
 
-  SPIFFS.begin(true); // recorder uses SPIFFS internally too
+  SPIFFS.begin(true);
 
-  // Servos
   servoFront.attach(SERVO_FRONT_PIN);
   servoRear.attach(SERVO_REAR_PIN);
   centerSteer();
 
-  // Wheels
   WheelPins p{ L298_IN1, L298_IN2, L298_ENA, L298_IN3, L298_IN4, L298_ENB };
   wheels.begin(p, WHEEL_PWM_FREQ_HZ, WHEEL_PWM_BITS);
-  Serial.println(F("[OK] Wheels ready."));
 
-  // Recorder
-  if (recorder.begin()) {
-    recorder.setSampleMs(50); // 20 Hz
-    Serial.printf("[REC] next auto slot: #%d\n", readNextSlot());
-  } else {
-    Serial.println(F("[REC] SPIFFS mount failed"));
-  }
+  if (recorder.begin()) recorder.setSampleMs(50); // 20Hz
+  else Serial.println(F("[REC] SPIFFS mount failed"));
 
-  // Network
-  WiFi.mode(WIFI_AP);
-  IPAddress apIP(AP_IP_OCT1,AP_IP_OCT2,AP_IP_OCT3,AP_IP_OCT4);
-  IPAddress gw(AP_GW_OCT1,AP_GW_OCT2,AP_GW_OCT3,AP_GW_OCT4);
-  IPAddress msk(AP_MASK_OCT1,AP_MASK_OCT2,AP_MASK_OCT3,AP_MASK_OCT4);
-  WiFi.softAPConfig(apIP,gw,msk);
-  WiFi.softAP(WIFI_SSID,WIFI_PASS);
-  delay(200);
-
-  // HTTP
-  server.on("/",        HTTP_GET, handleIndex);
-  server.on("/ctl",     HTTP_GET, handleCtl);
-  server.on("/stop",    HTTP_GET, handleStop);
-  server.on("/center",  HTTP_GET, handleCenter);
-  server.on("/speed",   HTTP_GET, handleSpeed);
-
-  server.on("/rec/list",  HTTP_GET, handleRecList);
-  server.on("/rec/start", HTTP_GET, handleRecStart);
-  server.on("/rec/stop",  HTTP_GET, handleRecStop);
-  server.on("/rec/play",  HTTP_GET, handleRecPlay);
-  server.on("/rec/clear", HTTP_GET, handleRecClear);
-
-  server.begin();
-
-  printMenu(); printWheelHelp();
+  initWiFi();
+  initHttp();
 
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[UI] Connect '%s'/'%s' -> http://%s/\n", WIFI_SSID, WIFI_PASS, ip.toString().c_str());
+  Serial.printf("[UI] Connect '%s' / '%s' -> http://%s/\n", WIFI_SSID, WIFI_PASS, ip.toString().c_str());
 }
 
 void loop(){
-  // Recorder playback applies frames into inputs
+  // Apply recorder playback state (incl. servo angles when manual)
   recorder.tick(millis(), [](const RecFrame& fr){
-    joyX       = fr.x;
-    joyY       = fr.y;
-    uiMode     = (UIMode)fr.mode;
-    circleDiam = fr.diam;
-    g_speedMode= (SpeedMode)fr.speed;
+    manualSteer = (fr.manual != 0);
+    steerX      = fr.x;
+    driveY      = fr.y;
+    uiMode      = (UIMode)fr.mode;
+    circleDiam  = fr.diam;
+    g_speedMode = (SpeedMode)fr.speed;
+    if (manualSteer) {
+      g_manualFF = clampInt(fr.ff, FF_MIN, FF_MAX);
+      g_manualFR = clampInt(fr.fr, FR_MIN, FR_MAX);
+    }
   });
 
   server.handleClient();
 
-  // Serial quick keys
-  while (Serial.available()) {
-    int pk = Serial.peek();
-    if (pk=='\n'||pk=='\r'){ Serial.read(); continue; }
-    if (pk=='f'||pk=='r'||pk=='n'||pk=='m'||pk=='p') {
-      char k=(char)Serial.read();
-      if (k=='f') { Serial.read(); selectFront(); }
-      else if (k=='r') { Serial.read(); selectRear(); }
-      else if (k=='n') { Serial.read(); moveSelectedBy(-10); }
-      else if (k=='m') { Serial.read(); moveSelectedBy(+10); }
-      else if (k=='p') { Serial.read();
-        g_speedMode = (g_speedMode==SPEED_LOW)?SPEED_NORMAL:(g_speedMode==SPEED_NORMAL?SPEED_SPORT:SPEED_LOW);
-        Serial.printf("[SPEED] Mode: %s\n", g_speedMode==SPEED_SPORT?"SPORT":(g_speedMode==SPEED_LOW?"LOW":"NORMAL"));
-      }
-    } else break;
-  }
+  // Compute & apply motion
+  int ff=SERVO_CENTER, fr=SERVO_CENTER;
+  int base = (int)(driveY * 255.0f);
+  float steerExtent = 0.0f;
 
-  static String cmd;
-  if (readLine(Serial, cmd)) { cmd.trim(); if (cmd.length()) processLineCommand(cmd); cmd=""; }
-
-  // Planner & motors
-  if (!eStop) {
-    int ff, fr, base; float steerExtent;
-    planSteering(joyX, joyY, uiMode, circleDiam, ff, fr, base, steerExtent);
-    setFrontSteer(ff); setRearSteer(fr);
-    int spd = applySpeedScaling(base, steerExtent);
-    wheels.setSpeedBoth(constrain(spd, -255, 255));
+  if (!manualSteer) {
+    planSteering(steerX, driveY, uiMode, circleDiam, ff, fr, base, steerExtent);
+    setFrontSteer(ff);
+    setRearSteer(fr);
   } else {
-    wheels.setSpeedBoth(0);
+    setFrontSteer(g_manualFF);
+    setRearSteer(g_manualFR);
   }
+
+  int pwm = applySpeedScaling(base, steerExtent);
+  wheels.setSpeedBoth(eStop ? 0 : clampInt(pwm, -255, 255));
 }
